@@ -1,0 +1,15 @@
+[Unit]
+Description = "Gas Meter Monitor"
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python -m src.main -i 60
+WorkingDirectory=/home/pi/meter/
+StandardOutput=journal
+StandardError=journal
+Restart=on-failure
+RestartRetries=2
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
