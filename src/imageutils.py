@@ -11,26 +11,45 @@ import gzip
 import pickle
 import logging
 
-import cv2
 import numpy as np
 
 from sklearn.decomposition import RandomizedPCA
 from sklearn.preprocessing import StandardScaler
 
+from skimage.io import imread
+from skimage.util import pad
+from skimage.transform import resize, rescale, downscale_local_mean
+from skimage.filter import threshold_otsu
+from skimage.filter.rank import median
+from skimage.measure import label, moments, regionprops
+from skimage.morphology import disk, skeletonize, erosion
+
 #-----------------------------------------------------------------------------
 log = logging.getLogger('main')
 
 def prepare(img, angle=1.80):
-    # Black letters on white background.
-    img = np.invert(img)
-
-    # # Straighten-up the image.
-    # rows, cols = img.shape
-    # cor = (cols/2, rows/2)  # center of rotation
-    # M = cv2.getRotationMatrix2D(cor, angle, 1)
-    # img = cv2.warpAffine(img, M, (cols, rows))
-
+    img = median(img, disk(4))
     return img
+
+def bbox_to_slice(bbox):
+    return np.s_[bbox[0]:bbox[2], bbox[1]:bbox[3]]
+
+def largest_object(img):
+    labels = label(img, background=False, neighbors=8)
+    labels[labels != -1] += 1
+
+    props = [(prop.area, prop) for prop in regionprops(labels)]
+    if not props:
+        return None
+
+    area, prop = max(props)
+    return prop.image
+
+def padtosize(img, h, w):
+    ah, aw = img.shape
+    h = (h - ah) / 2
+    w = (w - aw) / 2
+    return pad(img, ((h, h+(ah%2)), (w, w+(aw%2))), mode='constant')
 
 def roi(img):
     # Select regions of interest (first and second digit).
@@ -38,67 +57,57 @@ def roi(img):
     B = img[120:360, 265:385]
     C = img[125:365, 520:640]
 
-    # Manually blank out some regions.
-    B[220:, 0:] = 255
-    B[:, 0:5] = 255
-    C[220:, 0:] = 255
-    C[:, 0:5] = 255
-
-    # A = cv2.medianBlur(A, 11)
-    # B = cv2.medianBlur(B, 11)
-    # C = cv2.medianBlur(C, 11)
-
-    A = cv2.GaussianBlur(A, (5, 5), 0)
-    B = cv2.GaussianBlur(B, (5, 5), 0)
-    C = cv2.GaussianBlur(C, (5, 5), 0)
+    assert A.shape == B.shape == C.shape
+    shape = A.shape
 
     # Apply Otsu's thresholding to the regions.
-    _, A = cv2.threshold(A, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    _, B = cv2.threshold(B, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    _, C = cv2.threshold(C, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    A = A > threshold_otsu(A)
+    B = B > threshold_otsu(B)
+    C = C > threshold_otsu(C)
 
-    # Apply adaptive thresholding to the regions.
-    # A = cv2.adaptiveThreshold(A, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 75, 8)
-    # B = cv2.adaptiveThreshold(B, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 75, 8)
-    # C = cv2.adaptiveThreshold(C, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 75, 8)
+    # Morphological transforms.
+    r = disk(3)
+    A = erosion(A, r) // 255
+    B = erosion(B, r) // 255
+    C = erosion(C, r) // 255
 
-    # Resize
-    r = 50.0 / A.shape[1]
-    dim = (50, int(A.shape[0] * r))
-    A = cv2.resize(A, dim, interpolation = cv2.INTER_LINEAR)
-    B = cv2.resize(B, dim, interpolation = cv2.INTER_LINEAR)
-    C = cv2.resize(C, dim, interpolation = cv2.INTER_LINEAR)
+    # Skeletonize and narrow down to largest region.
+    A = largest_object(skeletonize(A))
+    B = largest_object(skeletonize(B))
+    C = largest_object(skeletonize(C))
+
+    # Pad back into the original size.
+    A = padtosize(A, shape[0], shape[1])
+    B = padtosize(B, shape[0], shape[1])
+    C = padtosize(C, shape[0], shape[1])
+
+    # Rescale.
+    A = downscale_local_mean(A, (5,5))
+    B = downscale_local_mean(B, (5,5))
+    C = downscale_local_mean(C, (5,5))
 
     return A, B, C
 
 def imgdir_to_array(topdir):
-    images, labels = [], []
+    images, labels, paths = [], [], []
 
     dirs = (i for i in topdir.iterdir() if i.is_dir())
     for dir in dirs:
         label = int(dir.name[0])
         for path in dir.iterdir():
-            img = cv2.imread(str(path), 0)
+            img = imread(str(path), 0)
             images.append(img)
             labels.append(label)
+            paths.append(path)
 
-    return np.array(images), np.array(labels)
+    return np.array(images), np.array(labels), paths
 
-def loadmodels(pA, pB, pC):
-    with gzip.open(pA, 'rb') as fh:
-        log.info('%s ...', pA)
-        knn_A = pickle.load(fh)
+def loadmodels(models):
+    with gzip.open(models, 'rb') as fh:
+        log.info('%s ...', fh.name)
+        pca_A, std_A, knn_A, pca_B, std_B, knn_B, pca_C, std_C, knn_C = pickle.load(fh)
 
-    with gzip.open(pB, 'rb') as fh:
-        log.info('%s ...', pB)
-        knn_B = pickle.load(fh)
-
-    with gzip.open(pC, 'rb') as fh:
-        log.info('%s ...', pC)
-        knn_C = pickle.load(fh)
-
-    knn_A.set_params(n_neighbors=5, weights='distance')
-    knn_B.set_params(n_neighbors=5, weights='distance')
-    knn_C.set_params(n_neighbors=5, weights='distance')
-
-    return knn_A, knn_B, knn_C
+    # knn_A.set_params(n_neighbors=5, weights='distance')
+    # knn_B.set_params(n_neighbors=5, weights='distance')
+    # knn_C.set_params(n_neighbors=5, weights='distance')
+    return pca_A, std_A, knn_A, pca_B, std_B, knn_B, pca_C, std_C, knn_C

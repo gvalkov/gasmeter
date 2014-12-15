@@ -4,56 +4,76 @@
 
 import cv2
 import gzip, pickle
+import multiprocessing as mp
 import numpy as np
+
 from invoke import task, run
 from pathlib import Path
+from itertools import product
 
 from sklearn.decomposition import RandomizedPCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import KNeighborsClassifier
+from skimage.io import imread, imsave, imread_collection
 
 from src.imageutils import prepare, roi, imgdir_to_array
 
 
 #-----------------------------------------------------------------------------
 datadir = Path('./data/')
-training_model_base = datadir / 'knn_%s.pickle.gz'
-training_data_npz   = datadir / 'training-data.npz'
-training_data_dir   = datadir / 'training/'
+training_models   = datadir / 'models.pickle.gz'
+training_data_npz = datadir / 'training-data.npz'
+training_data_dir = datadir / 'training/'
+testing_data_dir  = datadir / 'testing/'
+labeled_data_dir  = datadir / 'labeled/'
 raw_training_data_dir = datadir / 'raw/'
 
-
 @task
-def prepare_raw_images():
-    if not training_data_dir.exists():
-        (training_data_dir/'A').mkdir(parents=True)
-        (training_data_dir/'B').mkdir(parents=True)
-        (training_data_dir/'C').mkdir(parents=True)
+def prepare_labeled(root='training', parallel=False):
+    root = {'training': training_data_dir, 'testing': testing_data_dir}[root]
 
-    for path in raw_training_data_dir.iterdir():
-        img = cv2.imread(str(path), 0)
-        img = prepare(img)
-        A, B, C = roi(img)
+    # Create all destination directories.
+    labels = product('ABC', '0123456789')
+    for group, label in labels:
+        path = root/group/label
+        if not path.exists():
+            path.mkdir(parents=True)
 
-        dest_A = training_data_dir / 'A' / path.name
-        dest_B = training_data_dir / 'B' / path.name
-        dest_C = training_data_dir / 'C' / path.name
+    ic = imread_collection('%s/*/*/*.jpg' % labeled_data_dir)
+    images = ((ic[n], name, root) for n, name in enumerate(ic.files))
 
-        print('%s:' % path)
-        print('A: %s' % dest_A)
-        print('B: %s' % dest_B)
-        print('C: %s' % dest_C)
+    if parallel:
+        pool = mp.Pool(7)
+        pool.map(prepare_labeled_inner, images)
+    else:
+        for img in images:
+            prepare_labeled_inner(img)
 
-        cv2.imwrite(str(dest_A), A)
-        cv2.imwrite(str(dest_B), B)
-        cv2.imwrite(str(dest_C), C)
+def prepare_labeled_inner(arg):
+    img, name, root = arg
+
+    name = Path(name)
+    group, label = name.parts[-3:-1]  # e.g. A, 1
+
+    img = prepare(img)
+    A, B, C = roi(img)
+
+    img = vars()[group]  # A, B or C
+    dest = root / group / label / name.with_suffix('.png').name
+    print('Source: %s\nDest: %s' % (name, dest))
+
+    if any(i is None for i in (A,B,C)):
+        print('Invalid input ... skipping.')
+        return
+
+    imsave(str(dest), img)
 
 @task(aliases=['training-data'])
 def training_data():
     print('Loading images from %s.' % training_data_dir)
-    images_A, labels_A = imgdir_to_array(training_data_dir/'A')
-    images_B, labels_B = imgdir_to_array(training_data_dir/'B')
-    images_C, labels_C = imgdir_to_array(training_data_dir/'C')
+    images_A, labels_A, paths_A = imgdir_to_array(training_data_dir/'A')
+    images_B, labels_B, paths_A = imgdir_to_array(training_data_dir/'B')
+    images_C, labels_C, paths_A = imgdir_to_array(training_data_dir/'C')
 
     def getcounts(arr):
         counts = np.bincount(arr)
@@ -71,6 +91,45 @@ def training_data():
                         images_C=images_C, labels_C=labels_C)
 
 @task
+def invert_images(dest='training'):
+    dest = {'training': training_data_dir, 'testing': testing_data_dir}[dest]
+
+    for path in dest.rglob('**/*.png'):
+        print('%s' % path)
+
+        img = imread(str(path), 0)
+        img = np.invert(img)
+        imsave(str(path), img)
+
+@task
+def train_pca_std():
+    print('Loading training data %s.' % training_data_npz)
+    npz = np.load(str(training_data_npz))
+    images_A, labels_A = npz['images_A'], npz['labels_A']
+    images_B, labels_B = npz['images_B'], npz['labels_B']
+    images_C, labels_C = npz['images_C'], npz['labels_C']
+
+    def trainset(data, labels):
+        pca = RandomizedPCA(n_components=10)
+        std = StandardScaler()
+        data = np.reshape(data, (data.shape[0], -1))
+        data = pca.fit_transform(data)
+        data = std.fit_transform(data)
+        knn = KNeighborsClassifier()
+        knn.fit(data, labels)
+
+        return pca, std, knn
+
+    pca_A, std_A, knn_A = trainset(images_A, labels_A)
+    pca_B, std_B, knn_B = trainset(images_B, labels_B)
+    pca_C, std_C, knn_C = trainset(images_C, labels_C)
+
+    with gzip.open(str(training_models), 'wb') as fh:
+        print('Serializing to %s.' % fh.name)
+        res = [pca_A, std_A, knn_A, pca_B, std_B, knn_B, pca_C, std_C, knn_C]
+        pickle.dump(res, fh)
+
+@task
 def train():
     print('Loading training data %s.' % training_data_npz)
     npz = np.load(str(training_data_npz))
@@ -78,47 +137,23 @@ def train():
     images_B, labels_B = npz['images_B'], npz['labels_B']
     images_C, labels_C = npz['images_C'], npz['labels_C']
 
-    print('Reshaping and packing bits.')
-    images_A = np.reshape(images_A, (images_A.shape[0], -1))
-    images_B = np.reshape(images_B, (images_B.shape[0], -1))
-    images_C = np.reshape(images_C, (images_C.shape[0], -1))
+    def trainset(data, labels):
+        knn = KNeighborsClassifier()
+        knn.fit(data.reshape(data.shape[0], -1), labels)
+        return knn
 
-    pca = RandomizedPCA(n_components=10)
-    std = StandardScaler()
+    knn_A = trainset(images_A, labels_A)
+    knn_B = trainset(images_B, labels_B)
+    knn_C = trainset(images_C, labels_C)
 
-    images_A = pca.fit_transform(images_A)
-    images_B = pca.fit_transform(images_B)
-    images_C = pca.fit_transform(images_C)
-
-    images_A = std.fit_transform(images_A)
-    images_B = std.fit_transform(images_B)
-    images_C = std.fit_transform(images_C)
-
-    knn_A = KNeighborsClassifier()
-    knn_B = KNeighborsClassifier()
-    knn_C = KNeighborsClassifier()
-    knn_A.fit(images_A, labels_A)
-    knn_B.fit(images_B, labels_B)
-    knn_C.fit(images_C, labels_C)
-
-    with gzip.open(str(training_model_base) % 'A', 'wb') as fh:
+    with gzip.open(str(training_models), 'wb') as fh:
         print('Serializing to %s.' % fh.name)
-        pickle.dump(knn_A, fh)
-
-    with gzip.open(str(training_model_base) % 'B', 'wb') as fh:
-        print('Serializing to %s.' % fh.name)
-        pickle.dump(knn_B, fh)
-
-    with gzip.open(str(training_model_base) % 'C', 'wb') as fh:
-        print('Serializing to %s.' % fh.name)
-        pickle.dump(knn_C, fh)
+        res = [knn_A, knn_B, knn_C]
+        pickle.dump(res, fh)
 
 @task
 def clean():
-    knn_A = Path(str(training_model_base) % 'A')
-    knn_B = Path(str(training_model_base) % 'B')
-
-    paths = [knn_A, knn_B, training_data_npz]
+    paths = [training_models, training_data_npz]
     for path in paths:
         if path.exists():
             print('Removing %s' % path)
